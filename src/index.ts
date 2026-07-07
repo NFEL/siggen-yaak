@@ -51,23 +51,45 @@ function extractPath(rawUrl: string): string {
 }
 
 /**
+ * Decodes the `b64'...'` payload format Yaak's template renderer uses for string
+ * argument values that contain characters outside [A-Za-z0-9 _] — e.g. a Base64
+ * private key, which always contains "+", "/" or "=". Uses the URL-safe,
+ * unpadded Base64 alphabet, matching the yaak-templates Rust implementation.
+ */
+function decodeTemplateBase64(text: string): string {
+  let normalized = text.replace(/-/g, "+").replace(/_/g, "/");
+  while (normalized.length % 4 !== 0) normalized += "=";
+  return Buffer.from(normalized, "base64").toString("utf8");
+}
+
+/**
  * Finds the raw string value of a named argument (e.g. `private_key`) inside a
- * `payok.signature(...)` template tag on any of the request's headers. The
- * returned value may itself contain a nested template tag (e.g. an environment
+ * `payok.signature(...)` template tag on any of the request's headers.
+ *
+ * Yaak serializes string argument values one of two ways:
+ *   - name='plain text'      when the text is only letters/digits/spaces/underscores
+ *   - name=b64'<base64url>'  otherwise — always the case for real private keys,
+ *                            since Base64 keys contain "+", "/" or "=" characters.
+ *
+ * The returned value may itself contain a nested template tag (e.g. an environment
  * variable reference) — render it via ctx.templates.render() to resolve it.
  */
 function extractSignatureArg(
   headers: Array<{ value: string; enabled?: boolean }>,
   argName: string,
 ): string | null {
+  const pattern = new RegExp(
+    `${argName}\\s*=\\s*(?:b64'([^']*)'|'([^']*)'|"([^"]*)")`,
+  );
   for (const header of headers) {
     if (header.enabled === false) continue;
     const value = header.value ?? "";
     if (!value.includes("payok.signature")) continue;
-    const match = value.match(
-      new RegExp(`${argName}\\s*=\\s*(['"])([\\s\\S]*?)\\1`),
-    );
-    if (match) return match[2];
+    const match = value.match(pattern);
+    if (!match) continue;
+    if (match[1] !== undefined) return decodeTemplateBase64(match[1]);
+    if (match[2] !== undefined) return match[2];
+    if (match[3] !== undefined) return match[3];
   }
   return null;
 }
