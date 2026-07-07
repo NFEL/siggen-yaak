@@ -82,6 +82,31 @@ MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSj...
 
 ---
 
+## Export Signature Code
+
+Right-click any request in the sidebar (or open the request's actions menu) and select **Export Signature Code** to generate a standalone code snippet that reproduces the PAYOK signature algorithm — using the current request's body, endpoint path, and private key — in your language of choice:
+
+- JavaScript (Node.js)
+- Python
+- Java
+- Go
+- PHP
+- C# (.NET)
+
+Pick a language from the dropdown to regenerate the snippet, then click **Copy to Clipboard**. Each snippet is fully standalone (only using each language's standard library, plus `cryptography` for Python and `openssl` for PHP) and implements the exact same steps as `payok.signature`:
+
+1. Strip any `-----BEGIN/END (RSA) PRIVATE KEY-----` headers from the supplied Base64 key and rewrap it as a PKCS#8 PEM block.
+2. Build the message as `<body> + "&" + <path>`.
+3. Sign the message with RSA-SHA256 (PKCS#1 v1.5 padding).
+4. Base64-encode the resulting signature.
+
+The private key is read from the `sign` header's `payok.signature(...)` tag on the current request (same source as the path), including resolving nested references such as `${[ getEnvironmentVariable(...) ]}`. If no `sign` header is configured yet, a `PASTE_YOUR_BASE64_PKCS8_PRIVATE_KEY_HERE` placeholder is used instead.
+
+> ⚠️ **Security note:** when a real key is found, the exported code — and your clipboard — contains your actual private key in plaintext. Don't paste it into shared chats, tickets, or commit it to version control.
+
+
+---
+
 ## Signing Algorithm
 
 ```
