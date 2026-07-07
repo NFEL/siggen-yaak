@@ -4,7 +4,7 @@ import type {
   EditorLanguage,
   PluginDefinition,
 } from "@yaakapp/api";
-import { createSign, randomUUID } from "node:crypto";
+import { createSign, createVerify, randomUUID } from "node:crypto";
 import {
   generateCode,
   LANGUAGE_OPTIONS,
@@ -29,6 +29,37 @@ function generateSignature(
   const sign = createSign("RSA-SHA256");
   sign.update(message, "utf8");
   return sign.sign(pem, "base64");
+}
+
+function buildPublicKeyPem(keyInput: string): string {
+  const stripped = keyInput
+    .replace(/-----BEGIN PUBLIC KEY-----/g, "")
+    .replace(/-----END PUBLIC KEY-----/g, "")
+    .replace(/\s+/g, "");
+  return `-----BEGIN PUBLIC KEY-----\n${stripped}\n-----END PUBLIC KEY-----`;
+}
+
+/**
+ * Verifies a signature against a body, path, and RSA public key. Mirrors
+ * generateSignature()'s message format (`body + "&" + path`) for outgoing
+ * requests.
+ *
+ * If `path` is blank, the message is just `body` with no separator. This
+ * matches how PAYOK signs asynchronous notifications/webhooks sent to your
+ * server — those signatures cover only the body, since there's no fixed
+ * "path" on PAYOK's side for a merchant-controlled callback URL.
+ */
+function verifySignature(
+  body: string,
+  path: string,
+  signatureBase64: string,
+  publicKeyBase64: string,
+): boolean {
+  const message = path ? `${body}&${path}` : body;
+  const pem = buildPublicKeyPem(publicKeyBase64);
+  const verify = createVerify("RSA-SHA256");
+  verify.update(message, "utf8");
+  return verify.verify(pem, signatureBase64, "base64");
 }
 
 function extractBodyText(body: Record<string, any>): string | null {
@@ -240,6 +271,22 @@ export const plugin: PluginDefinition = {
         }
       },
     },
+    {
+      label: "Verify Incoming Signature",
+      icon: "check_circle",
+      async onSelect(ctx, args) {
+        try {
+          await runVerifyIncomingSignature(ctx, args);
+        } catch (err) {
+          await ctx.toast.show({
+            message: `Failed to verify signature: ${String(
+              err instanceof Error ? err.message : err,
+            )}`,
+            color: "danger",
+          });
+        }
+      },
+    },
   ],
 };
 
@@ -320,4 +367,92 @@ async function runExportSignatureCode(
       color: "success",
     });
   }
+}
+
+/**
+ * Renders the live verification result as Markdown for the "Verify Incoming
+ * Signature" dialog. Never throws — invalid Base64/keys are reported as a
+ * friendly error message instead of crashing the dynamic form.
+ */
+function formatVerifyResult(values: { [key: string]: unknown }): string {
+  const body = typeof values.body === "string" ? values.body : "";
+  const signature =
+    typeof values.signature === "string" ? values.signature.trim() : "";
+  const publicKey =
+    typeof values.publicKey === "string" ? values.publicKey.trim() : "";
+
+  if (!signature || !publicKey) {
+    return "_Fill in the signature and public key below to see the result._";
+  }
+
+  try {
+    const isValid = verifySignature(body, "", signature, publicKey);
+    return isValid
+      ? "✅ **Valid** — the signature matches this body and public key."
+      : "❌ **Invalid** — the signature does not match this body and public key.";
+  } catch (err) {
+    return `⚠️ **Error** — ${String(
+      err instanceof Error ? err.message : err,
+    )}. Check that the public key and signature are valid Base64.`;
+  }
+}
+
+/**
+ * Lets the user paste a received body/signature/public key (e.g. from an
+ * incoming PAYOK notification/webhook) and see, live, whether the signature
+ * is valid — without having to run any exported code. Uses the same
+ * RSA-SHA256 verification as verifySignature() above, over the body alone,
+ * matching how PAYOK signs notifications/webhooks (no path involved).
+ */
+async function runVerifyIncomingSignature(
+  ctx: Context,
+  args: CallHttpRequestActionArgs,
+): Promise<void> {
+  const { httpRequest } = args;
+
+  const rawBodyText = extractBodyText(httpRequest.body) ?? "";
+  const renderedBody = rawBodyText
+    ? await safeRenderTemplate(ctx, rawBodyText)
+    : "";
+
+  await ctx.prompt.form({
+    id: "payok-verify-incoming-signature",
+    title: "Verify Incoming Signature",
+    description:
+      "Check whether a signature you received (e.g. on an incoming PAYOK notification/webhook) is valid, using the counterparty's RSA public key. The result below updates live as you edit the fields.",
+    size: "lg",
+    confirmText: "Done",
+    inputs: [
+      {
+        type: "text",
+        name: "body",
+        label: "Body",
+        placeholder: '{"merchantOrderId":"ORDER-123","amount":10000}',
+        defaultValue: renderedBody,
+        multiLine: true,
+        optional: true,
+      },
+      {
+        type: "text",
+        name: "signature",
+        label: "Signature to Verify (Base64)",
+        placeholder: "Base64-encoded RSA-SHA256 signature you received",
+        multiLine: true,
+      },
+      {
+        type: "text",
+        name: "publicKey",
+        label: "Public Key (Base64 or PEM)",
+        placeholder: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A...",
+        multiLine: true,
+      },
+      {
+        type: "markdown",
+        content: formatVerifyResult({}),
+        dynamic: (_ctx, dynArgs) => ({
+          content: formatVerifyResult(dynArgs.values),
+        }),
+      },
+    ],
+  });
 }

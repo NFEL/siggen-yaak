@@ -1,6 +1,6 @@
 {
   "name": "@cibofdevs/payok-siggen",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "PAYOK Signature Generator plugin for Yaak HTTP Client",
   "displayName": "PAYOK Signature Generator",
   "main": "build/index.js",
