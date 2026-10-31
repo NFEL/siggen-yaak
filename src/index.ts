@@ -1,6 +1,7 @@
 import type {
   CallHttpRequestActionArgs,
   Context,
+  DynamicTemplateFunctionArg,
   EditorLanguage,
   PluginDefinition,
 } from "@yaakapp/api";
@@ -10,6 +11,9 @@ import {
   LANGUAGE_OPTIONS,
   type SupportedLanguage,
 } from "./codegen";
+import {
+  buildSelectedMessage, DEFAULT_FIELDS, fieldCount, lookupOptions, MAX_FIELDS,
+} from "./selection";
 
 function buildPrivateKeyPem(keyInput: string): string {
   const stripped = keyInput
@@ -19,12 +23,7 @@ function buildPrivateKeyPem(keyInput: string): string {
   return `-----BEGIN PRIVATE KEY-----\n${stripped}\n-----END PRIVATE KEY-----`;
 }
 
-function generateSignature(
-  body: string,
-  path: string,
-  privateKeyBase64: string,
-): string {
-  const message = `${body}&${path}`;
+function generateSignature(message: string, privateKeyBase64: string): string {
   const pem = buildPrivateKeyPem(privateKeyBase64);
   const sign = createSign("RSA-SHA256");
   sign.update(message, "utf8");
@@ -146,40 +145,163 @@ const LANGUAGE_TO_EDITOR: Record<SupportedLanguage, EditorLanguage> = {
   go: "go",
   php: "php",
   csharp: "csharp",
+  rust: "text",
 };
 
 const TS_CACHE_KEY = "payok_ts";
 const UUID_CACHE_KEY = "payok_uuid";
 const TS_CACHE_TTL = 10_000;
 
+const selectionInputs: DynamicTemplateFunctionArg[] = Array.from(
+  { length: MAX_FIELDS },
+  (_, index) => {
+    const row = index + 1;
+    return {
+      type: "h_stack",
+      inputs: [],
+      async dynamic(ctx, args) {
+        if (args.values.message_mode !== "selected" || row > fieldCount(args.values)) {
+          return { hidden: true, inputs: [] };
+        }
+        const id = await ctx.window.requestId();
+        const request = id ? await ctx.httpRequest.getById({ id }) : null;
+        const options = lookupOptions(request);
+        const name = String(args.values[`field_${row}_name`] ?? DEFAULT_FIELDS[index] ?? "");
+        const defaultValue = "";
+        const current = String(args.values[`field_${row}_lookup`] ?? defaultValue);
+        if (!options.some(option => option.value === current)) {
+          options.push({ label: `Saved lookup → ${current}`, value: current });
+        }
+        return {
+          hidden: false,
+          inputs: [
+            {
+              type: "select", name: `field_${row}_lookup`, label: name || `Field ${row}`,
+              options, defaultValue,
+              description: "Choose the request value to sign, or leave this field out.",
+            },
+            {
+              type: "accordion", label: `Advanced: ${name || `field ${row}`}`,
+              inputs: [
+                { type: "text", name: `field_${row}_name`, label: "Name in signed JSON", defaultValue: DEFAULT_FIELDS[index] ?? "" },
+                {
+                  type: "text", name: `field_${row}_custom`, label: "Custom request path",
+                  placeholder: "body:/nested/Amount or header:TrackId",
+                  hidden: current !== "custom",
+                },
+              ],
+            },
+          ],
+        };
+      },
+    };
+  },
+);
+
 export const plugin: PluginDefinition = {
   templateFunctions: [
     {
       name: "payok.signature",
       description:
-        "Generate PAYOK RSA-SHA256 digital signature. Reads the request body automatically from context.",
+        "Choose what to sign, then select where each value comes from in your request.",
       previewType: "none",
       args: [
+        {
+          type: "select", name: "message_mode", label: "What to sign",
+          defaultValue: "payok",
+          options: [
+            { label: "Entire request body + endpoint (PAYOK)", value: "payok" },
+            { label: "Choose request fields", value: "selected" },
+          ],
+        },
         {
           type: "text",
           name: "path",
           label: "Endpoint Path",
           placeholder: "/api/v1/payment",
+          dynamic: (_ctx, args) => ({ hidden: args.values.message_mode === "selected", optional: args.values.message_mode === "selected" }),
         },
         {
           type: "text",
           name: "private_key",
-          label: "Private Key (Base64, without PEM headers)",
-          placeholder: "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC...",
+          label: "Private key",
+          placeholder: "Paste your key or insert an environment variable",
+          description: "PKCS#8 PEM or Base64. Use an environment variable to keep the key out of the request.",
           password: true,
-          multiLine: true,
+        },
+        {
+          type: "select", name: "preset", label: "Preset", defaultValue: "none",
+          options: [
+            { label: "Choose fields myself", value: "none" },
+            { label: "Tejarat Bank — حواله", value: "tejarat" },
+          ],
+          dynamic: (_ctx, args) => ({ hidden: args.values.message_mode !== "selected" }),
+        },
+        {
+          type: "text", name: "tejarat_client_variable", label: "Client ID variable", defaultValue: "client_id",
+          dynamic: (_ctx, args) => ({ hidden: args.values.message_mode !== "selected" || args.values.preset !== "tejarat" }),
+        },
+        ...DEFAULT_FIELDS.filter(name => !["IssuedAt", "iat", "clientId"].includes(name)).map(name => ({
+          type: "select" as const, name: `tejarat_${name}`, label: name, options: [],
+          async dynamic(ctx: Context, args: { values: Record<string, unknown> }) {
+            if (args.values.message_mode !== "selected" || args.values.preset !== "tejarat") return { hidden: true };
+            const id = await ctx.window.requestId();
+            const request = id ? await ctx.httpRequest.getById({ id }) : null;
+            const options = lookupOptions(request).filter(option => option.value !== "custom");
+            const aliases: Record<string, string[]> = {
+              DebtorAccount: ["query::SourceAccountNumber", "body:/sourceAccountNumber"],
+              CreditorAccount: ["body:/destinationAccountNumber"],
+              Amount: ["body:/amount"],
+              IdempotencyKey: ["query:TrackId"],
+            };
+            const candidates = [`body:/${name}`, `header:${name.toLowerCase()}`, `query:${name}`, ...(aliases[name] ?? [])];
+            return {
+              hidden: false,
+              options: options.map(option => option.value ? option : { label: name === "CreditorFirstName" || name === "CreditorLastName" ? "Omit (optional)" : "Select request value…", value: "" }),
+              defaultValue: candidates.find(value => options.some(option => option.value === value)) ?? "",
+            };
+          },
+        })),
+        {
+          type: "banner", inputs: [],
+          async dynamic(ctx, args) {
+            if (args.values.message_mode !== "selected" || args.values.preset === "tejarat") return { hidden: true, inputs: [] };
+            const id = await ctx.window.requestId();
+            const request = id ? await ctx.httpRequest.getById({ id }) : null;
+            const options = lookupOptions(request).filter(option => /^(body:.+|header:|query:)/.test(option.value));
+            return {
+              hidden: false,
+              inputs: [
+                { type: "markdown", content: "**Include in signature** — tick the fields you need. Field names are taken from your request." },
+                ...options.map(option => ({
+                  type: "checkbox" as const,
+                  name: `include_${Buffer.from(option.value).toString("base64url")}`,
+                  label: option.label,
+                  defaultValue: "false",
+                })),
+              ],
+            };
+          },
+        },
+        {
+          type: "accordion", label: "Custom field names and mappings (optional)",
+          inputs: [
+            {
+              type: "select", name: "field_count", label: "Custom mapping rows",
+              defaultValue: String(DEFAULT_FIELDS.length),
+              options: Array.from({ length: MAX_FIELDS }, (_, i) => ({ label: String(i + 1), value: String(i + 1) })),
+            },
+            ...selectionInputs,
+          ],
+          dynamic: (_ctx, args) => ({ hidden: args.values.message_mode !== "selected" || args.values.preset === "tejarat" }),
         },
       ],
       async onRender(ctx, args) {
         const path = String(args.values.path ?? "").trim();
         const privateKey = String(args.values.private_key ?? "").trim();
 
-        if (!path || !privateKey) return null;
+        const selected = args.values.message_mode === "selected";
+        if ((!selected && !path) || !privateKey) return null;
 
         const requestId = await ctx.window.requestId();
         if (!requestId) return null;
@@ -187,9 +309,8 @@ export const plugin: PluginDefinition = {
         const rawRequest = await ctx.httpRequest.getById({ id: requestId });
         if (!rawRequest) return null;
 
-        // Read raw body text (template tags still unresolved) to avoid render recursion
         const rawBodyText = extractBodyText(rawRequest.body);
-        if (!rawBodyText) return null;
+        if (!selected && !rawBodyText) return null;
 
         // Expire caches so each send gets a fresh timestamp and UUID.
         // payok.timestamp/payok.uuid will regenerate values on the next call and
@@ -197,16 +318,19 @@ export const plugin: PluginDefinition = {
         await ctx.store.set(TS_CACHE_KEY, { ts: "", at: 0 });
         await ctx.store.set(UUID_CACHE_KEY, { id: "", at: 0 });
 
-        // Render only the body string — ctx.templates.render resolves {{ }} tags
-        // without triggering a full request render (no infinite recursion)
-        const renderedBody = await ctx.templates.render({
-          data: rawBodyText,
-          purpose: args.purpose,
-        });
+        if (selected) {
+          const message = await buildSelectedMessage(ctx, rawRequest, args.values, args.purpose);
+          if (args.values.preset === "tejarat") {
+            const input = `${Buffer.from('{"alg":"RS256","typ":"JWS"}').toString("base64url")}.${Buffer.from(message).toString("base64url")}`;
+            return `${input}.${Buffer.from(generateSignature(input, privateKey), "base64").toString("base64url")}`;
+          }
+          return generateSignature(message, privateKey);
+        }
 
+        // Render only the body to avoid recursively rendering the signature header.
+        const renderedBody = await ctx.templates.render({ data: rawBodyText!, purpose: args.purpose });
         if (typeof renderedBody !== "string" || !renderedBody) return null;
-
-        return generateSignature(renderedBody, path, privateKey);
+        return generateSignature(`${renderedBody}&${path}`, privateKey);
       },
     },
     {
@@ -296,12 +420,27 @@ async function runExportSignatureCode(
 ): Promise<void> {
   const { httpRequest } = args;
 
+  const selectionValues: Record<string, string> = {};
+  for (const name of [
+    "message_mode", "field_count", "preset", "tejarat_client_variable", ...DEFAULT_FIELDS.map(name => `tejarat_${name}`),
+    ...lookupOptions(httpRequest).filter(option => /^(body:.+|header:|query:)/.test(option.value))
+      .map(option => `include_${Buffer.from(option.value).toString("base64url")}`),
+    ...Array.from({ length: MAX_FIELDS }, (_, i) => [
+      `field_${i + 1}_name`, `field_${i + 1}_lookup`, `field_${i + 1}_custom`,
+    ]).flat(),
+  ]) {
+    const value = extractSignatureArg(httpRequest.headers, name);
+    if (value !== null) selectionValues[name] = value;
+  }
+  const selected = selectionValues.message_mode === "selected";
   const rawBodyText = extractBodyText(httpRequest.body) ?? "";
-  const renderedBody = rawBodyText
-    ? await safeRenderTemplate(ctx, rawBodyText)
-    : "";
-  const renderedUrl = await safeRenderTemplate(ctx, httpRequest.url);
-  const path = extractPath(renderedUrl);
+  const renderedBody = selected
+    ? await buildSelectedMessage(ctx, httpRequest, selectionValues, "preview")
+    : rawBodyText ? await safeRenderTemplate(ctx, rawBodyText) : "";
+  const rawPath = extractSignatureArg(httpRequest.headers, "path");
+  const path = selected ? "" : rawPath !== null
+    ? await safeRenderTemplate(ctx, rawPath)
+    : extractPath(await safeRenderTemplate(ctx, httpRequest.url));
 
   // Resolve the actual private key from the `sign` header's payok.signature(...)
   // tag, the same way the path and body are resolved from the live request.
@@ -317,6 +456,8 @@ async function runExportSignatureCode(
   const codegenInput = {
     path,
     body: renderedBody,
+    messageMode: selected ? "selected" as const : "payok" as const,
+    compactJws: selected && selectionValues.preset === "tejarat",
     privateKey: privateKey || undefined,
   };
 
@@ -324,8 +465,8 @@ async function runExportSignatureCode(
     id: "payok-export-signature-code",
     title: "Export Signature Code",
     description: privateKey
-      ? "Standalone code that reproduces the PAYOK signature algorithm using this request's current path, body, and private key. This code contains your real private key — handle it securely."
-      : "Standalone code that reproduces the PAYOK signature algorithm using this request's current path and body. No private_key was found on the sign header, so a TODO comment in the exported code tells you where to paste your own key.",
+      ? "Standalone code using this request's signature payload and private key. This code contains your real private key — handle it securely."
+      : "Standalone code using this request's signature payload. No private_key was found, so replace the private-key placeholder before running.",
     size: "lg",
     confirmText: "Copy to Clipboard",
     cancelText: "Close",

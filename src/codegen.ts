@@ -20,19 +20,21 @@ export type SupportedLanguage =
   | "java"
   | "go"
   | "php"
+  | "rust"
   | "csharp";
 
 export const LANGUAGE_OPTIONS: Array<{
   label: string;
   value: SupportedLanguage;
 }> = [
-  { label: "JavaScript (Node.js)", value: "javascript" },
-  { label: "Python", value: "python" },
-  { label: "Java", value: "java" },
-  { label: "Go", value: "go" },
-  { label: "PHP", value: "php" },
-  { label: "C# (.NET)", value: "csharp" },
-];
+    { label: "JavaScript (Node.js)", value: "javascript" },
+    { label: "Python", value: "python" },
+    { label: "Java", value: "java" },
+    { label: "Go", value: "go" },
+    { label: "PHP", value: "php" },
+    { label: "Rust", value: "rust" },
+    { label: "C# (.NET)", value: "csharp" },
+  ];
 
 const PRIVATE_KEY_PLACEHOLDER = "PASTE_YOUR_BASE64_PKCS8_PRIVATE_KEY_HERE";
 const WEBHOOK_BODY_PLACEHOLDER = "PASTE_RECEIVED_WEBHOOK_BODY_HERE";
@@ -57,6 +59,9 @@ function escapeString(value: string, lang: SupportedLanguage): string {
 export interface CodegenInput {
   path: string;
   body: string;
+  /** Selected JSON is signed as-is, without the PAYOK endpoint suffix. */
+  messageMode?: "payok" | "selected";
+  compactJws?: boolean;
   /** The actual private key resolved from the request's `sign` header, if found. */
   privateKey?: string;
 }
@@ -65,23 +70,38 @@ export function generateCode(
   lang: SupportedLanguage,
   input: CodegenInput,
 ): string {
-  const path = input.path || "/api-pay/payment/V3.2/order/create-api";
-  const body = input.body || '{"merchantOrderId":"ORDER-123","amount":10000}';
+  if (lang === "rust") return generateRust(input);
+  if (input.compactJws) {
+    const signingInput = `${Buffer.from('{"alg":"RS256","typ":"JWS"}').toString("base64url")}.${Buffer.from(input.body).toString("base64url")}`;
+    const code = generateCode(lang, { ...input, body: signingInput, messageMode: "selected", compactJws: false });
+    // Keep the language-specific signing helpers unchanged: they sign the JWS input bytes.
+    switch (lang) {
+      case "javascript": return code.replace("console.log('sign:', signature);", "console.log('sign:', BODY + '.' + Buffer.from(signature, 'base64').toString('base64url'));");
+      case "python": return code.replace('print("sign:", signature)', 'print("sign:", BODY + "." + base64.urlsafe_b64encode(base64.b64decode(signature)).decode("ascii").rstrip("="))');
+      case "java": return code.replace('System.out.println("sign: " + sign);', 'System.out.println("sign: " + body + "." + Base64.getUrlEncoder().withoutPadding().encodeToString(Base64.getDecoder().decode(sign)));');
+      case "go": return code.replace('fmt.Println("sign:", signature)', 'fmt.Println("sign:", body + "." + strings.TrimRight(strings.NewReplacer("+", "-", "/", "_").Replace(signature), "="))');
+      case "php": return code.replace('$signature = generateSignature($body, $path, $privateKeyBase64);', '$signature = $body . "." . rtrim(strtr(generateSignature($body, $path, $privateKeyBase64), "+/", "-_"), "=");');
+      case "csharp": return code.replace('Console.WriteLine($"sign: {signature}");', 'Console.WriteLine("sign: " + body + "." + signature.TrimEnd(\'=\').Replace(\'+\', \'-\').Replace(\'/\', \'_\'));');
+    }
+  }
+  const selected = input.messageMode === "selected";
+  const path = selected ? "" : input.path || "/api-pay/payment/V3.2/order/create-api";
+  const body = input.body;
   const privateKey = input.privateKey || PRIVATE_KEY_PLACEHOLDER;
 
   switch (lang) {
     case "javascript":
-      return generateJavaScript(path, body, privateKey);
+      return generateJavaScript(path, body, privateKey, selected);
     case "python":
-      return generatePython(path, body, privateKey);
+      return generatePython(path, body, privateKey, selected);
     case "java":
-      return generateJava(path, body, privateKey);
+      return generateJava(path, body, privateKey, selected);
     case "go":
-      return generateGo(path, body, privateKey);
+      return generateGo(path, body, privateKey, selected);
     case "php":
-      return generatePhp(path, body, privateKey);
+      return generatePhp(path, body, privateKey, selected);
     case "csharp":
-      return generateCSharp(path, body, privateKey);
+      return generateCSharp(path, body, privateKey, selected);
     default:
       return "";
   }
@@ -108,6 +128,7 @@ function generateJavaScript(
   path: string,
   body: string,
   privateKey: string,
+  selected: boolean,
 ): string {
   const p = escapeString(path, "javascript");
   const b = escapeString(body, "javascript");
@@ -124,7 +145,7 @@ function buildPrivateKeyPem(base64Key) {
 }
 
 function generateSignature(body, path, privateKeyBase64) {
-  const message = \`\${body}&\${path}\`;
+  const message = ${selected ? "body" : "`\${body}&\${path}`"};
   const pem = buildPrivateKeyPem(privateKeyBase64);
   const sign = crypto.createSign('RSA-SHA256');
   sign.update(message, 'utf8');
@@ -173,6 +194,7 @@ function generatePython(
   path: string,
   body: string,
   privateKey: string,
+  selected: boolean,
 ): string {
   const p = escapeString(path, "python");
   const b = escapeString(body, "python");
@@ -198,7 +220,7 @@ def build_private_key_pem(base64_key: str) -> bytes:
 
 
 def generate_signature(body: str, path: str, private_key_base64: str) -> str:
-    message = f"{body}&{path}".encode("utf-8")
+    message = ${selected ? "body" : 'f"{body}&{path}"'}.encode("utf-8")
     pem = build_private_key_pem(private_key_base64)
     private_key = serialization.load_pem_private_key(pem, password=None)
     signature = private_key.sign(message, padding.PKCS1v15(), hashes.SHA256())
@@ -256,7 +278,7 @@ if __name__ == "__main__":
 `;
 }
 
-function generateJava(path: string, body: string, privateKey: string): string {
+function generateJava(path: string, body: string, privateKey: string, selected: boolean): string {
   const p = escapeString(path, "java");
   const b = escapeString(body, "java");
   const k = escapeString(privateKey, "java");
@@ -282,7 +304,7 @@ public class PayokSignature {
     }
 
     public static String generateSignature(String body, String path, String privateKeyBase64) throws Exception {
-        String message = body + "&" + path;
+        String message = ${selected ? "body" : 'body + "&" + path'};
         String cleanedKey = buildBase64Key(privateKeyBase64);
         byte[] keyBytes = Base64.getDecoder().decode(cleanedKey);
 
@@ -348,7 +370,7 @@ public class PayokSignature {
 `;
 }
 
-function generateGo(path: string, body: string, privateKey: string): string {
+function generateGo(path: string, body: string, privateKey: string, selected: boolean): string {
   const p = escapeString(path, "go");
   const b = escapeString(body, "go");
   const k = escapeString(privateKey, "go");
@@ -381,7 +403,7 @@ func cleanBase64PublicKey(raw string) string {
 }
 
 func generateSignature(body, path, privateKeyBase64 string) (string, error) {
-	message := body + "&" + path
+	message := ${selected ? "body" : 'body + "&" + path'}
 
 	keyBytes, err := base64.StdEncoding.DecodeString(cleanBase64Key(privateKeyBase64))
 	if err != nil {
@@ -469,7 +491,7 @@ func main() {
 `;
 }
 
-function generatePhp(path: string, body: string, privateKey: string): string {
+function generatePhp(path: string, body: string, privateKey: string, selected: boolean): string {
   const p = escapeString(path, "php");
   const b = escapeString(body, "php");
   const k = escapeString(privateKey, "php");
@@ -485,7 +507,7 @@ function buildPrivateKeyPem(string $base64Key): string
 
 function generateSignature(string $body, string $path, string $privateKeyBase64): string
 {
-    $message = $body . '&' . $path;
+    $message = ${selected ? "$body" : "$body . '&' . $path"};
     $pem = buildPrivateKeyPem($privateKeyBase64);
 
     $privateKey = openssl_pkey_get_private($pem);
@@ -547,6 +569,7 @@ function generateCSharp(
   path: string,
   body: string,
   privateKey: string,
+  selected: boolean,
 ): string {
   const p = escapeString(path, "csharp");
   const b = escapeString(body, "csharp");
@@ -568,7 +591,7 @@ public static class PayokSignature
 
     public static string GenerateSignature(string body, string path, string privateKeyBase64)
     {
-        string message = $"{body}&{path}";
+        string message = ${selected ? "body" : '$"{body}&{path}"'};
         byte[] keyBytes = Convert.FromBase64String(BuildBase64Key(privateKeyBase64));
 
         using var rsa = RSA.Create();
@@ -626,6 +649,79 @@ public static class PayokSignature
         bool isWebhookValid = VerifySignature(webhookBody, "", webhookSignature, webhookPublicKeyBase64);
         Console.WriteLine($"webhook valid: {isWebhookValid}");
     }
+}
+`;
+}
+
+function generateRust(input: CodegenInput): string {
+  const key = escapeString(input.privateKey || PRIVATE_KEY_PLACEHOLDER, "rust");
+  const body = escapeString(input.body, "rust");
+  const path = escapeString(input.path, "rust");
+  return `${secretWarning(input.privateKey || PRIVATE_KEY_PLACEHOLDER, "//")}// Save as src/main.rs in a Cargo project.
+// Add dependencies: cargo add openssl base64
+use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine};
+use openssl::{hash::MessageDigest, pkey::{PKey, Private, Public}, rsa::Padding, sign::{Signer, Verifier}};
+use std::error::Error;
+
+fn private_key(raw: &str) -> Result<PKey<Private>, Box<dyn Error>> {
+    if raw.contains("-----BEGIN") {
+        Ok(PKey::private_key_from_pem(raw.as_bytes())?)
+    } else {
+        let clean: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
+        Ok(PKey::private_key_from_der(&STANDARD.decode(clean)?)?)
+    }
+}
+
+fn public_key(raw: &str) -> Result<PKey<Public>, Box<dyn Error>> {
+    if raw.contains("-----BEGIN") {
+        Ok(PKey::public_key_from_pem(raw.as_bytes())?)
+    } else {
+        let clean: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
+        Ok(PKey::public_key_from_der(&STANDARD.decode(clean)?)?)
+    }
+}
+
+fn sign_message(message: &[u8], raw_key: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+    let key = private_key(raw_key)?;
+    let mut signer = Signer::new(MessageDigest::sha256(), &key)?;
+    signer.set_rsa_padding(Padding::PKCS1)?;
+    signer.update(message)?;
+    Ok(signer.sign_to_vec()?)
+}
+
+fn verify_message(message: &[u8], signature: &[u8], raw_key: &str) -> Result<bool, Box<dyn Error>> {
+    let key = public_key(raw_key)?;
+    let mut verifier = Verifier::new(MessageDigest::sha256(), &key)?;
+    verifier.set_rsa_padding(Padding::PKCS1)?;
+    verifier.update(message)?;
+    Ok(verifier.verify(signature)?)
+}
+
+fn verify_signature(body: &str, path: &str, signature: &str, key: &str) -> Result<bool, Box<dyn Error>> {
+    let message = if path.is_empty() { body.to_owned() } else { format!("{}&{}", body, path) };
+    verify_message(message.as_bytes(), &STANDARD.decode(signature)?, key)
+}
+
+fn verify_jws(token: &str, key: &str) -> Result<bool, Box<dyn Error>> {
+    let parts: Vec<&str> = token.split('.').collect();
+    // Require the same RS256 protected header emitted by this exporter.
+    if parts.len() != 3 || URL_SAFE_NO_PAD.decode(parts[0])? != br#"{"alg":"RS256","typ":"JWS"}"# {
+        return Err("Unsupported JWS protected header or invalid compact format".into());
+    }
+    let message = format!("{}.{}", parts[0], parts[1]);
+    verify_message(message.as_bytes(), &URL_SAFE_NO_PAD.decode(parts[2])?, key)
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let key = "${key}";
+    let body = "${body}";
+    let path = "${path}";
+    ${input.compactJws
+      ? 'let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWS"}"#);\n    let message = format!("{}.{}", header, URL_SAFE_NO_PAD.encode(body.as_bytes()));\n    let signature = sign_message(message.as_bytes(), key)?;\n    println!("sign: {}.{}", message, URL_SAFE_NO_PAD.encode(signature));'
+      : `let message = ${input.messageMode === "selected" ? "body.to_owned()" : 'format!("{}&{}", body, path)'};\n    println!("sign: {}", STANDARD.encode(sign_message(message.as_bytes(), key)?));`}
+    // Optional webhook: verify_signature(received_body, "", received_signature, public_key)?
+    // Optional compact JWS: verify_jws(received_token, public_key)?
+    Ok(())
 }
 `;
 }
